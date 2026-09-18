@@ -1,0 +1,61 @@
+name: Diagnose ExHentai layout
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      EH_COOKIE: ${{ secrets.EH_COOKIE }}
+
+    steps:
+      - name: Diagnose gallery layout
+        run: |
+          set -euo pipefail
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36'
+
+          curl -L -sS \
+            -A "$UA" \
+            --cookie "$EH_COOKIE" \
+            --cookie-jar /tmp/exh.cookies \
+            -o /dev/null \
+            'https://exhentai.org/?inline_set=dm_e'
+
+          curl -L -sS \
+            -A "$UA" \
+            --cookie /tmp/exh.cookies \
+            --cookie-jar /tmp/exh.cookies \
+            -o /tmp/exh.html \
+            'https://exhentai.org/'
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          html = Path('/tmp/exh.html').read_text(
+              encoding='utf-8',
+              errors='ignore',
+          )
+
+          classes = sorted(set(re.findall(
+              r'class=["\'][^"\']*\bitg\b[^"\']*["\']',
+              html,
+              flags=re.I,
+          )))
+
+          print('itg classes:')
+          for item in classes[:20]:
+              print(' ', item)
+
+          lower = html.lower()
+          print('contains glte:', 'glte' in lower)
+          print('contains gltc:', 'gltc' in lower)
+          print('contains gltm:', 'gltm' in lower)
+          print('gallery links:', lower.count('https://exhentai.org/g/'))
+          PY
