@@ -27,9 +27,13 @@ jobs:
             -o /dev/null \
             'https://exhentai.org/?inline_set=dm_e'
 
+          echo "response cookie names:"
+          awk 'BEGIN{FS="\t"} !/^#/ && NF >= 7 {print "  " $6}' /tmp/exh.cookies | sort -u
+
           http_code="$(curl -L -sS --compressed \
             -A "$UA" \
             --cookie "$EH_COOKIE" \
+            --cookie /tmp/exh.cookies \
             --cookie-jar /tmp/exh.cookies \
             -o /tmp/exh.html \
             -w '%{http_code}' \
