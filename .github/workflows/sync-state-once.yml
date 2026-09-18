@@ -54,20 +54,39 @@ jobs:
           zstd -d -f violet-state.db.zst -o violet-state.db
           ls -lh violet-state.db violet-state.db.zst
 
-      - name: Verify seed DB
+      - name: Record before state
         run: |
           python3 - <<'PY'
+          import json
           import sqlite3
-          p='work/violet-state.db'
-          db=sqlite3.connect(p)
-          check=db.execute('PRAGMA quick_check').fetchone()[0]
-          count,max_id=db.execute('SELECT COUNT(*), MAX(Id) FROM HitomiColumnModel').fetchone()
-          print('quick_check:', check)
-          print('rows before:', count)
-          print('max id before:', max_id)
+
+          p = 'work/violet-state.db'
+          db = sqlite3.connect(p)
+          check = db.execute('PRAGMA quick_check').fetchone()[0]
+          row = db.execute("""
+              SELECT
+                COUNT(*),
+                MAX(Id),
+                SUM(CASE WHEN LOWER(COALESCE(Language,'')) = 'korean' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN ExistOnHitomi = 1 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN ExistOnHitomi = 0 THEN 1 ELSE 0 END)
+              FROM HitomiColumnModel
+          """).fetchone()
+          db.close()
+
+          data = {
+              'quick_check': check,
+              'rows': row[0],
+              'max_id': row[1],
+              'korean_rows': row[2] or 0,
+              'hitomi_rows': row[3] or 0,
+              'exh_only_rows': row[4] or 0,
+          }
+          print(json.dumps(data, ensure_ascii=False, indent=2))
           if check != 'ok':
               raise SystemExit('seed database failed quick_check')
-          db.close()
+          with open('work/before.json', 'w', encoding='utf-8') as fp:
+              json.dump(data, fp, ensure_ascii=False, indent=2)
           PY
 
       - name: Build fast-hsync
@@ -84,23 +103,42 @@ jobs:
           fi
           mkdir -p work/chunk
           cd work
-          FAST_HSYNC_QUIET=1 ../fast-hsync violet-state.db --with-exh
+          FAST_HSYNC_QUIET=1 ../fast-hsync violet-state.db --with-exh 2>&1 | tee sync.log
 
-      - name: Checkpoint and verify updated DB
+      - name: Checkpoint and record after state
         run: |
           python3 - <<'PY'
+          import json
           import sqlite3
-          p='work/violet-state.db'
-          db=sqlite3.connect(p)
+
+          p = 'work/violet-state.db'
+          db = sqlite3.connect(p)
           print('wal checkpoint:', db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone())
-          check=db.execute('PRAGMA quick_check').fetchone()[0]
-          count,max_id=db.execute('SELECT COUNT(*), MAX(Id) FROM HitomiColumnModel').fetchone()
-          print('quick_check:', check)
-          print('rows after:', count)
-          print('max id after:', max_id)
+          check = db.execute('PRAGMA quick_check').fetchone()[0]
+          row = db.execute("""
+              SELECT
+                COUNT(*),
+                MAX(Id),
+                SUM(CASE WHEN LOWER(COALESCE(Language,'')) = 'korean' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN ExistOnHitomi = 1 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN ExistOnHitomi = 0 THEN 1 ELSE 0 END)
+              FROM HitomiColumnModel
+          """).fetchone()
+          db.close()
+
+          data = {
+              'quick_check': check,
+              'rows': row[0],
+              'max_id': row[1],
+              'korean_rows': row[2] or 0,
+              'hitomi_rows': row[3] or 0,
+              'exh_only_rows': row[4] or 0,
+          }
+          print(json.dumps(data, ensure_ascii=False, indent=2))
           if check != 'ok':
               raise SystemExit('updated database failed quick_check')
-          db.close()
+          with open('work/after.json', 'w', encoding='utf-8') as fp:
+              json.dump(data, fp, ensure_ascii=False, indent=2)
           PY
           rm -f work/violet-state.db-wal work/violet-state.db-shm
           ls -lh work/violet-state.db
@@ -114,22 +152,90 @@ jobs:
           ls -lh violet-state.db.zst
           sha256sum violet-state.db.zst
 
-      - name: Replace state release asset
+      - name: Build verification report
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from datetime import datetime, timezone, timedelta
+
+          with open('work/before.json', encoding='utf-8') as fp:
+              before = json.load(fp)
+          with open('work/after.json', encoding='utf-8') as fp:
+              after = json.load(fp)
+          with open('work/sync.log', encoding='utf-8', errors='ignore') as fp:
+              log = fp.read()
+
+          m = re.search(r'Sync complete! Upserted (\d+) records\.', log)
+          upserted = int(m.group(1)) if m else None
+
+          h = hashlib.sha256()
+          with open('work/violet-state.db.zst', 'rb') as fp:
+              for chunk in iter(lambda: fp.read(1024 * 1024), b''):
+                  h.update(chunk)
+
+          now = datetime.now(timezone.utc)
+          kst = timezone(timedelta(hours=9))
+          report = {
+              'ok': after['quick_check'] == 'ok',
+              'synced_at_utc': now.isoformat(timespec='seconds'),
+              'synced_at_kst': now.astimezone(kst).isoformat(timespec='seconds'),
+              'before': before,
+              'after': after,
+              'delta': {
+                  'rows': after['rows'] - before['rows'],
+                  'max_id': (after['max_id'] or 0) - (before['max_id'] or 0),
+                  'korean_rows': after['korean_rows'] - before['korean_rows'],
+                  'hitomi_rows': after['hitomi_rows'] - before['hitomi_rows'],
+                  'exh_only_rows': after['exh_only_rows'] - before['exh_only_rows'],
+              },
+              'fast_hsync_upserted': upserted,
+              'state_asset': {
+                  'name': 'violet-state.db.zst',
+                  'bytes': os.path.getsize('work/violet-state.db.zst'),
+                  'sha256': h.hexdigest(),
+              },
+              'github': {
+                  'repository': os.environ.get('GITHUB_REPOSITORY'),
+                  'run_id': os.environ.get('GITHUB_RUN_ID'),
+                  'run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT'),
+                  'sha': os.environ.get('GITHUB_SHA'),
+              },
+          }
+
+          with open('work/sync-status.json', 'w', encoding='utf-8') as fp:
+              json.dump(report, fp, ensure_ascii=False, indent=2)
+
+          print(json.dumps(report, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Replace state release assets
         run: |
           set -euo pipefail
           gh release upload db-state \
             work/violet-state.db.zst \
+            work/sync-status.json \
             --repo "${{ github.repository }}" \
             --clobber
 
       - name: Summary
-        if: always()
+        if: success()
         run: |
-          {
-            echo "## Violet DB state sync"
-            echo
-            echo "- Seed release: db-state"
-            echo "- Collector: pingpingjinping/violet fast-hsync"
-            echo "- ExHentai: authenticated via EH_COOKIE secret"
-            echo "- Updated state asset: violet-state.db.zst"
-          } >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          with open('work/sync-status.json', encoding='utf-8') as fp:
+              s = json.load(fp)
+          print("## Violet DB sync verification")
+          print()
+          print(f"- Last sync (KST): {s['synced_at_kst']}")
+          print(f"- Integrity: {'OK' if s['ok'] else 'FAIL'}")
+          print(f"- Rows: {s['before']['rows']:,} → {s['after']['rows']:,} ({s['delta']['rows']:+,})")
+          print(f"- Max ID: {s['before']['max_id']} → {s['after']['max_id']} ({s['delta']['max_id']:+,})")
+          print(f"- Korean rows: {s['before']['korean_rows']:,} → {s['after']['korean_rows']:,} ({s['delta']['korean_rows']:+,})")
+          print(f"- Hitomi rows: {s['before']['hitomi_rows']:,} → {s['after']['hitomi_rows']:,} ({s['delta']['hitomi_rows']:+,})")
+          print(f"- ExHentai-only rows: {s['before']['exh_only_rows']:,} → {s['after']['exh_only_rows']:,} ({s['delta']['exh_only_rows']:+,})")
+          print(f"- fast-hsync upserted: {s['fast_hsync_upserted']}")
+          print(f"- State SHA-256: \`{s['state_asset']['sha256']}\`")
+          PY
