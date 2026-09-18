@@ -220,6 +220,46 @@ jobs:
             --repo "${{ github.repository }}" \
             --clobber
 
+      - name: Update release notes
+        run: |
+          python3 - <<'PY'
+          import json
+
+          with open('work/sync-status.json', encoding='utf-8') as fp:
+              s = json.load(fp)
+
+          before = s['before']
+          after = s['after']
+          delta = s['delta']
+
+          def fmt(n):
+              return f"{n:,}"
+
+          body = f"""## Violet DB Sync Status
+
+Last sync: {s['synced_at_kst']} (KST)
+
+- Rows: {fmt(before['rows'])} → {fmt(after['rows'])} ({delta['rows']:+,})
+- Max ID: {fmt(before['max_id'])} → {fmt(after['max_id'])} ({delta['max_id']:+,})
+- Korean rows: {fmt(before['korean_rows'])} → {fmt(after['korean_rows'])} ({delta['korean_rows']:+,})
+- Hitomi rows: {fmt(before['hitomi_rows'])} → {fmt(after['hitomi_rows'])} ({delta['hitomi_rows']:+,})
+- ExHentai-only: {fmt(before['exh_only_rows'])} → {fmt(after['exh_only_rows'])} ({delta['exh_only_rows']:+,})
+- Upserted: {s['fast_hsync_upserted'] if s['fast_hsync_upserted'] is not None else 'unknown'}
+- Integrity: {'OK' if s['ok'] else 'FAIL'}
+
+State asset SHA-256:
+`{s['state_asset']['sha256']}`
+
+GitHub Actions run: {s['github']['run_id']}
+"""
+          with open('work/release-notes.md', 'w', encoding='utf-8') as fp:
+              fp.write(body)
+          PY
+
+          gh release edit db-state \
+            --repo "${{ github.repository }}" \
+            --notes-file work/release-notes.md
+
       - name: Summary
         if: success()
         run: |
