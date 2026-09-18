@@ -1,0 +1,133 @@
+name: Sync DB state once
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: violet-db-state
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      COOKIE: ${{ secrets.EH_COOKIE }}
+
+    steps:
+      - name: Checkout mirror repo
+        uses: actions/checkout@v4
+
+      - name: Checkout Violet source
+        uses: actions/checkout@v4
+        with:
+          repository: pingpingjinping/violet
+          path: violet
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: violet/fast-hsync/go.sum
+
+      - name: Install zstd
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd
+
+      - name: Download state DB seed
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          cd work
+          gh release download db-state \
+            --repo "${{ github.repository }}" \
+            --pattern 'violet-state.db.zst' \
+            --clobber
+          zstd -d -f violet-state.db.zst -o violet-state.db
+          ls -lh violet-state.db violet-state.db.zst
+
+      - name: Verify seed DB
+        run: |
+          python3 - <<'PY'
+          import sqlite3
+          p='work/violet-state.db'
+          db=sqlite3.connect(p)
+          check=db.execute('PRAGMA quick_check').fetchone()[0]
+          count,max_id=db.execute('SELECT COUNT(*), MAX(Id) FROM HitomiColumnModel').fetchone()
+          print('quick_check:', check)
+          print('rows before:', count)
+          print('max id before:', max_id)
+          if check != 'ok':
+              raise SystemExit('seed database failed quick_check')
+          db.close()
+          PY
+
+      - name: Build fast-hsync
+        working-directory: violet/fast-hsync
+        run: |
+          go build -trimpath -o ../../fast-hsync .
+
+      - name: Sync Hitomi and ExHentai
+        run: |
+          set -euo pipefail
+          if [ -z "$COOKIE" ]; then
+            echo "EH_COOKIE secret is missing."
+            exit 1
+          fi
+          mkdir -p work/chunk
+          cd work
+          FAST_HSYNC_QUIET=1 ../fast-hsync violet-state.db --with-exh
+
+      - name: Checkpoint and verify updated DB
+        run: |
+          python3 - <<'PY'
+          import sqlite3
+          p='work/violet-state.db'
+          db=sqlite3.connect(p)
+          print('wal checkpoint:', db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone())
+          check=db.execute('PRAGMA quick_check').fetchone()[0]
+          count,max_id=db.execute('SELECT COUNT(*), MAX(Id) FROM HitomiColumnModel').fetchone()
+          print('quick_check:', check)
+          print('rows after:', count)
+          print('max id after:', max_id)
+          if check != 'ok':
+              raise SystemExit('updated database failed quick_check')
+          db.close()
+          PY
+          rm -f work/violet-state.db-wal work/violet-state.db-shm
+          ls -lh work/violet-state.db
+
+      - name: Compress updated state
+        run: |
+          set -euo pipefail
+          cd work
+          rm -f violet-state.db.zst
+          zstd -T0 -5 violet-state.db -o violet-state.db.zst
+          ls -lh violet-state.db.zst
+          sha256sum violet-state.db.zst
+
+      - name: Replace state release asset
+        run: |
+          set -euo pipefail
+          gh release upload db-state \
+            work/violet-state.db.zst \
+            --repo "${{ github.repository }}" \
+            --clobber
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Violet DB state sync"
+            echo
+            echo "- Seed release: db-state"
+            echo "- Collector: pingpingjinping/violet fast-hsync"
+            echo "- ExHentai: authenticated via EH_COOKIE secret"
+            echo "- Updated state asset: violet-state.db.zst"
+          } >> "$GITHUB_STEP_SUMMARY"
