@@ -50,6 +50,7 @@ jobs:
           gh release download db-state --repo "${{ github.repository }}" --pattern 'violet-state.db.zst' --clobber
           gh release download db-state --repo "${{ github.repository }}" --pattern 'rawdata-korean.db' --clobber || true
           gh release download db-state --repo "${{ github.repository }}" --pattern 'syncversion.txt' --clobber || true
+          gh release download db-state --repo "${{ github.repository }}" --pattern 'delta-manifest.json' --clobber || true
           if [ ! -f syncversion.txt ]; then rm -f rawdata-korean.db; fi
           zstd -d -f violet-state.db.zst -o violet-state.db
           ls -lh violet-state.db violet-state.db.zst
@@ -111,6 +112,18 @@ jobs:
           with open('work/after.json','w',encoding='utf-8') as f: json.dump(data,f,ensure_ascii=False,indent=2)
           PY
           rm -f work/violet-state.db-wal work/violet-state.db-shm
+
+      - name: Build incremental delta
+        run: |
+          set -euo pipefail
+          python3 scripts/build-delta.py \
+            --chunk-dir work/chunk \
+            --before work/before.json \
+            --after work/after.json \
+            --manifest work/delta-manifest.json \
+            --out-dir work \
+            --run-id "${{ github.run_id }}"
+          ls -lh work/delta-"${{ github.run_id }}".json.zst work/delta-manifest.json
 
       - name: Export Korean DB
         run: |
@@ -183,7 +196,15 @@ jobs:
       - name: Replace release assets
         run: |
           set -euo pipefail
-          gh release upload db-state work/violet-state.db.zst work/rawdata-korean.db work/syncversion.txt work/sync-status.json --repo "${{ github.repository }}" --clobber
+          gh release upload db-state \
+            work/violet-state.db.zst \
+            work/rawdata-korean.db \
+            work/syncversion.txt \
+            work/sync-status.json \
+            work/delta-manifest.json \
+            work/delta-"${{ github.run_id }}".json.zst \
+            --repo "${{ github.repository }}" \
+            --clobber
 
       - name: Update release notes
         run: |
