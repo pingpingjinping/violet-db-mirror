@@ -1,0 +1,216 @@
+name: Sync Violet DB
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 */6 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: violet-db-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      COOKIE: ${{ secrets.EH_COOKIE }}
+
+    steps:
+      - name: Checkout mirror repo
+        uses: actions/checkout@v4
+
+      - name: Checkout Violet source
+        uses: actions/checkout@v4
+        with:
+          repository: pingpingjinping/violet
+          path: violet
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: violet/fast-hsync/go.sum
+
+      - name: Install zstd
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd
+
+      - name: Download previous release assets
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          cd work
+          gh release download db-state --repo "${{ github.repository }}" --pattern 'violet-state.db.zst' --clobber
+          gh release download db-state --repo "${{ github.repository }}" --pattern 'rawdata-korean.db' --clobber || true
+          gh release download db-state --repo "${{ github.repository }}" --pattern 'syncversion.txt' --clobber || true
+          if [ ! -f syncversion.txt ]; then rm -f rawdata-korean.db; fi
+          zstd -d -f violet-state.db.zst -o violet-state.db
+          ls -lh violet-state.db violet-state.db.zst
+
+      - name: Record before state
+        run: |
+          python3 - <<'PY'
+          import json, sqlite3
+          db = sqlite3.connect('work/violet-state.db')
+          check = db.execute('PRAGMA quick_check').fetchone()[0]
+          row = db.execute("""
+              SELECT COUNT(*), MAX(Id),
+                     SUM(CASE WHEN lower(trim(coalesce(Language,'')))='korean' THEN 1 ELSE 0 END),
+                     SUM(CASE WHEN ExistOnHitomi=1 THEN 1 ELSE 0 END),
+                     SUM(CASE WHEN ExistOnHitomi=0 THEN 1 ELSE 0 END)
+              FROM HitomiColumnModel
+          """).fetchone()
+          db.close()
+          data = {'quick_check': check, 'rows': row[0], 'max_id': row[1],
+                  'korean_rows': row[2] or 0, 'hitomi_rows': row[3] or 0,
+                  'exh_only_rows': row[4] or 0}
+          print(json.dumps(data, ensure_ascii=False, indent=2))
+          if check != 'ok': raise SystemExit('seed database failed quick_check')
+          with open('work/before.json','w',encoding='utf-8') as f: json.dump(data,f,ensure_ascii=False,indent=2)
+          PY
+
+      - name: Build fast-hsync
+        working-directory: violet/fast-hsync
+        run: go build -trimpath -o ../../fast-hsync .
+
+      - name: Sync Hitomi and ExHentai
+        run: |
+          set -euo pipefail
+          test -n "$COOKIE" || { echo 'EH_COOKIE secret is missing'; exit 1; }
+          mkdir -p work/chunk
+          cd work
+          FAST_HSYNC_QUIET=1 ../fast-hsync violet-state.db --with-exh 2>&1 | tee sync.log
+
+      - name: Checkpoint and record after state
+        run: |
+          python3 - <<'PY'
+          import json, sqlite3
+          db = sqlite3.connect('work/violet-state.db')
+          print('wal checkpoint:', db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone())
+          check = db.execute('PRAGMA quick_check').fetchone()[0]
+          row = db.execute("""
+              SELECT COUNT(*), MAX(Id),
+                     SUM(CASE WHEN lower(trim(coalesce(Language,'')))='korean' THEN 1 ELSE 0 END),
+                     SUM(CASE WHEN ExistOnHitomi=1 THEN 1 ELSE 0 END),
+                     SUM(CASE WHEN ExistOnHitomi=0 THEN 1 ELSE 0 END)
+              FROM HitomiColumnModel
+          """).fetchone()
+          db.close()
+          data = {'quick_check': check, 'rows': row[0], 'max_id': row[1],
+                  'korean_rows': row[2] or 0, 'hitomi_rows': row[3] or 0,
+                  'exh_only_rows': row[4] or 0}
+          print(json.dumps(data, ensure_ascii=False, indent=2))
+          if check != 'ok': raise SystemExit('updated database failed quick_check')
+          with open('work/after.json','w',encoding='utf-8') as f: json.dump(data,f,ensure_ascii=False,indent=2)
+          PY
+          rm -f work/violet-state.db-wal work/violet-state.db-shm
+
+      - name: Export Korean DB
+        run: |
+          set -euo pipefail
+          python3 scripts/export-korean.py \
+            --source work/violet-state.db \
+            --output work/rawdata-korean.db \
+            --manifest work/syncversion.txt \
+            --download-url "https://github.com/${{ github.repository }}/releases/download/db-state/rawdata-korean.db"
+          python3 - <<'PY'
+          import json, sqlite3
+          with open('work/after.json',encoding='utf-8') as f: after=json.load(f)
+          db=sqlite3.connect('work/rawdata-korean.db')
+          check=db.execute('PRAGMA quick_check').fetchone()[0]
+          total=db.execute('SELECT COUNT(*) FROM HitomiColumnModel').fetchone()[0]
+          bad=db.execute("SELECT COUNT(*) FROM HitomiColumnModel WHERE lower(trim(coalesce(Language,''))) <> 'korean'").fetchone()[0]
+          db.close()
+          print('korean db quick_check:', check)
+          print('korean db rows:', total)
+          print('non-korean rows:', bad)
+          if check!='ok' or bad!=0 or total!=after['korean_rows']:
+              raise SystemExit('Korean DB validation failed')
+          PY
+          ls -lh work/rawdata-korean.db work/syncversion.txt
+          cat work/syncversion.txt
+
+      - name: Compress updated state
+        run: |
+          set -euo pipefail
+          cd work
+          rm -f violet-state.db.zst
+          zstd -T0 -5 violet-state.db -o violet-state.db.zst
+          ls -lh violet-state.db.zst
+
+      - name: Build verification report
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re
+          from datetime import datetime, timezone, timedelta
+          def sha256(path):
+              h=hashlib.sha256()
+              with open(path,'rb') as f:
+                  for chunk in iter(lambda:f.read(1024*1024), b''): h.update(chunk)
+              return h.hexdigest()
+          with open('work/before.json',encoding='utf-8') as f: before=json.load(f)
+          with open('work/after.json',encoding='utf-8') as f: after=json.load(f)
+          with open('work/sync.log',encoding='utf-8',errors='ignore') as f: log=f.read()
+          with open('work/syncversion.txt',encoding='utf-8') as f: version=f.read().strip()
+          m=re.search(r'Sync complete! Upserted (\d+) records\.',log)
+          upserted=int(m.group(1)) if m else None
+          monotonic=(after['rows']>=before['rows'] and (after['max_id'] or 0)>=(before['max_id'] or 0))
+          ok=(after['quick_check']=='ok' and monotonic)
+          now=datetime.now(timezone.utc); kst=timezone(timedelta(hours=9))
+          report={
+            'ok':ok, 'synced_at_utc':now.isoformat(timespec='seconds'),
+            'synced_at_kst':now.astimezone(kst).isoformat(timespec='seconds'),
+            'before':before, 'after':after,
+            'delta':{k:after[k]-before[k] for k in ['rows','korean_rows','hitomi_rows','exh_only_rows']},
+            'max_id_delta':(after['max_id'] or 0)-(before['max_id'] or 0),
+            'fast_hsync_upserted':upserted, 'syncversion':version,
+            'state_asset':{'name':'violet-state.db.zst','bytes':os.path.getsize('work/violet-state.db.zst'),'sha256':sha256('work/violet-state.db.zst')},
+            'korean_asset':{'name':'rawdata-korean.db','bytes':os.path.getsize('work/rawdata-korean.db'),'rows':after['korean_rows'],'sha256':sha256('work/rawdata-korean.db')},
+            'github':{'repository':os.environ.get('GITHUB_REPOSITORY'),'run_id':os.environ.get('GITHUB_RUN_ID'),'run_attempt':os.environ.get('GITHUB_RUN_ATTEMPT'),'sha':os.environ.get('GITHUB_SHA')}
+          }
+          with open('work/sync-status.json','w',encoding='utf-8') as f: json.dump(report,f,ensure_ascii=False,indent=2)
+          print(json.dumps(report,ensure_ascii=False,indent=2))
+          if not ok: raise SystemExit('verification monotonicity check failed')
+          PY
+
+      - name: Replace release assets
+        run: |
+          set -euo pipefail
+          gh release upload db-state work/violet-state.db.zst work/rawdata-korean.db work/syncversion.txt work/sync-status.json --repo "${{ github.repository }}" --clobber
+
+      - name: Update release notes
+        run: |
+          python3 - <<'PY'
+          import json
+          with open('work/sync-status.json',encoding='utf-8') as f: s=json.load(f)
+          b=s['before']; a=s['after']; d=s['delta']
+          lines=[
+            '## Violet DB Sync Status','',
+            f"Last sync: {s['synced_at_kst']} (KST)",'',
+            f"- Rows: {b['rows']:,} → {a['rows']:,} ({d['rows']:+,})",
+            f"- Max ID: {b['max_id']:,} → {a['max_id']:,} ({s['max_id_delta']:+,})",
+            f"- Korean rows: {b['korean_rows']:,} → {a['korean_rows']:,} ({d['korean_rows']:+,})",
+            f"- Hitomi rows: {b['hitomi_rows']:,} → {a['hitomi_rows']:,} ({d['hitomi_rows']:+,})",
+            f"- ExHentai-only: {b['exh_only_rows']:,} → {a['exh_only_rows']:,} ({d['exh_only_rows']:+,})",
+            f"- Upserted: {s['fast_hsync_upserted']}",
+            f"- Integrity: {'OK' if s['ok'] else 'FAIL'}",
+            f"- Korean DB size: {s['korean_asset']['bytes']/1048576:.1f} MiB",
+            f"- Sync version: {s['syncversion']}",'',
+            'State SHA-256:', s['state_asset']['sha256'],'',
+            'Korean DB SHA-256:', s['korean_asset']['sha256'],'',
+            f"GitHub Actions run: {s['github']['run_id']}"
+          ]
+          open('work/release-notes.md','w',encoding='utf-8').write('\n'.join(lines)+'\n')
+          PY
+          gh release edit db-state --repo "${{ github.repository }}" --notes-file work/release-notes.md
+
+      - name: Summary
+        if: success()
+        run: cat work/release-notes.md >> "$GITHUB_STEP_SUMMARY"
