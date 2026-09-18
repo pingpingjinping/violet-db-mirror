@@ -27,12 +27,16 @@ jobs:
             -o /dev/null \
             'https://exhentai.org/?inline_set=dm_e'
 
-          curl -L -sS \
+          http_code="$(curl -L -sS --compressed \
             -A "$UA" \
-            --cookie /tmp/exh.cookies \
+            --cookie "$EH_COOKIE" \
             --cookie-jar /tmp/exh.cookies \
             -o /tmp/exh.html \
-            'https://exhentai.org/'
+            -w '%{http_code}' \
+            'https://exhentai.org/')"
+
+          echo "second request HTTP: $http_code"
+          echo "second request bytes: $(wc -c </tmp/exh.html)"
 
           python3 - <<'PY'
           from pathlib import Path
