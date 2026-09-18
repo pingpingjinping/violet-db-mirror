@@ -37,25 +37,51 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import re
+          from html import unescape
 
           html = Path('/tmp/exh.html').read_text(
               encoding='utf-8',
               errors='ignore',
           )
+          lower = html.lower()
+
+          def first(pattern, flags=re.I | re.S):
+              m = re.search(pattern, html, flags)
+              return unescape(m.group(1)).strip() if m else '(none)'
+
+          print('title:', first(r'<title[^>]*>(.*?)</title>'))
+          print('html bytes:', len(html.encode('utf-8')))
 
           classes = sorted(set(re.findall(
-              r'class=["\'][^"\']*\bitg\b[^"\']*["\']',
+              r'<(?:table|div)[^>]*class=["\']([^"\']+)["\']',
               html,
               flags=re.I,
           )))
-
-          print('itg classes:')
-          for item in classes[:20]:
+          print('table/div classes:')
+          for item in classes[:40]:
               print(' ', item)
 
-          lower = html.lower()
+          absolute_links = len(re.findall(
+              r'https?://(?:www\.)?exhentai\.org/g/\d+/[0-9a-f]+',
+              html,
+              flags=re.I,
+          ))
+          relative_links = len(re.findall(
+              r'["\']/g/\d+/[0-9a-f]+',
+              html,
+              flags=re.I,
+          ))
+
+          print('absolute gallery links:', absolute_links)
+          print('relative gallery links:', relative_links)
           print('contains glte:', 'glte' in lower)
           print('contains gltc:', 'gltc' in lower)
           print('contains gltm:', 'gltm' in lower)
-          print('gallery links:', lower.count('https://exhentai.org/g/'))
+          print('contains sad panda:', 'sad panda' in lower)
+          print('contains login:', 'login' in lower)
+
+          text_only = re.sub(r'<script.*?</script>|<style.*?</style>', ' ', html, flags=re.I | re.S)
+          text_only = re.sub(r'<[^>]+>', ' ', text_only)
+          text_only = re.sub(r'\s+', ' ', unescape(text_only)).strip()
+          print('page text preview:', text_only[:500])
           PY
