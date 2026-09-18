@@ -1,0 +1,135 @@
+name: Test DB collector
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-collector:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      EH_COOKIE: ${{ secrets.EH_COOKIE }}
+
+    steps:
+      - name: Checkout mirror repo
+        uses: actions/checkout@v4
+
+      - name: Checkout Violet source
+        uses: actions/checkout@v4
+        with:
+          repository: pingpingjinping/violet
+          path: violet
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: violet/fast-hsync/go.sum
+
+      - name: Build fast-hsync
+        working-directory: violet/fast-hsync
+        run: |
+          go build -trimpath -o ../../fast-hsync .
+
+      - name: Test Hitomi collection
+        run: |
+          set -euo pipefail
+          mkdir -p test-output
+          cd test-output
+
+          ../fast-hsync test.db \
+            --start-id=4192000 \
+            --end-id=4192050 \
+            --quiet
+
+          python3 - <<'PY'
+          import sqlite3
+          import sys
+
+          db = sqlite3.connect("test.db")
+          count, max_id = db.execute(
+              "SELECT COUNT(*), MAX(Id) FROM HitomiColumnModel"
+          ).fetchone()
+          db.close()
+
+          print(f"Hitomi rows collected: {count}")
+          print(f"Max Hitomi ID: {max_id}")
+
+          if not count:
+              print("ERROR: Hitomi test produced zero rows.")
+              sys.exit(1)
+          PY
+
+      - name: Test ExHentai authenticated access
+        if: env.EH_COOKIE != ''
+        run: |
+          set -euo pipefail
+
+          http_code="$(
+            curl -L -sS \
+              -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36' \
+              -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+              --cookie "$EH_COOKIE" \
+              -o /tmp/exh.html \
+              -w '%{http_code}' \
+              'https://exhentai.org/?inline_set=dm_e'
+          )"
+
+          final_url="$(
+            curl -L -sS \
+              -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36' \
+              -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+              --cookie "$EH_COOKIE" \
+              -o /dev/null \
+              -w '%{url_effective}' \
+              'https://exhentai.org/?inline_set=dm_e'
+          )"
+
+          echo "ExHentai HTTP: $http_code"
+          echo "ExHentai final URL: $final_url"
+          echo "ExHentai response bytes: $(wc -c </tmp/exh.html)"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+
+          html = Path("/tmp/exh.html").read_text(
+              encoding="utf-8",
+              errors="ignore",
+          )
+          lower = html.lower()
+
+          extended = 'itg glte' in lower
+          exh_domain = 'exhentai' in lower
+
+          print(f"Extended gallery markup: {extended}")
+          print(f"ExHentai page marker: {exh_domain}")
+
+          if not (extended and exh_domain):
+              print("ERROR: authenticated ExHentai gallery page was not confirmed.")
+              sys.exit(1)
+          PY
+
+      - name: Note skipped ExHentai test
+        if: env.EH_COOKIE == ''
+        run: |
+          echo "EH_COOKIE secret is not configured; ExHentai test skipped."
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Violet DB collector test"
+            echo
+            echo "- fast-hsync build: attempted"
+            echo "- Hitomi small-range collection: see step result above"
+            if [ -n "$EH_COOKIE" ]; then
+              echo "- ExHentai authenticated access: see step result above"
+            else
+              echo "- ExHentai authenticated access: skipped (EH_COOKIE missing)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
